@@ -5,9 +5,9 @@ After=network.target
 [Service]
 Type=simple
 User=drone
-WorkingDirectory=/home/drone/drone_inference
-EnvironmentFile=/home/drone/drone_inference/.env
-ExecStart=/home/drone/drone_inference/.venv/bin/python main.py
+WorkingDirectory=/home/drone/robot_inference
+EnvironmentFile=/home/drone/robot_inference/.env
+ExecStart=/home/drone/robot_inference/.venv/bin/python main.py
 Restart=on-failure
 RestartSec=5
 

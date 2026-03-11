@@ -7,7 +7,7 @@ RPi5 robot camera system with a real-time VLM inference pipeline.
 ```
 Browser ──► RPi5 Web UI (FastAPI)
                │
-               ├─ CameraManager   ← picamera2, 640×480 continuous capture
+               ├─ CameraManager   ← rpicam-vid subprocess (MJPEG pipe, ~28 FPS)
                ├─ SnapshotWorker  ← 1 frame/s from latest_frame → deque
                ├─ InferenceScheduler  ← every 3s, 2 frames → POST to VLM API
                ├─ ResultManager   ← stores result, fans out via WebSocket
@@ -15,8 +15,8 @@ Browser ──► RPi5 Web UI (FastAPI)
 
                       ▼
              Inference API Server
-               └─ POST /infer  { "frames": [{"timestamp": …, "image": "<b64>"}] }
-               └─ returns any JSON
+               └─ POST /v1/chat/completions  (OpenAI-compatible vision API)
+               └─ returns JSON
 ```
 
 ## File layout
@@ -24,11 +24,11 @@ Browser ──► RPi5 Web UI (FastAPI)
 | File | Role |
 |---|---|
 | `config.py` | All tuneable constants / env vars |
-| `camera_manager.py` | Opens picamera2, keeps `latest_jpeg` fresh in a thread |
+| `camera_manager.py` | Runs rpicam-vid as a subprocess, parses MJPEG pipe, keeps `latest_jpeg` fresh |
 | `snapshot_worker.py` | Grabs 1 frame/s, stores in rolling `deque` |
 | `inference_scheduler.py` | Picks 2 frames every 3 s, POSTs to VLM API |
 | `result_manager.py` | Thread-safe result store + asyncio WebSocket broadcast |
-| `web_app.py` | FastAPI routes: `/`, `/stream.mjpeg`, `/api/status`, `/ws/results` |
+| `web_app.py` | FastAPI routes: `/`, `/stream.mjpeg`, `/api/status`, `/api/config`, `/ws/results` |
 | `main.py` | Wires everything, starts uvicorn |
 
 ## Setup
@@ -37,7 +37,7 @@ Browser ──► RPi5 Web UI (FastAPI)
 
 ```bash
 sudo apt update
-sudo apt install python3-picamera2
+sudo apt install rpicam-apps
 ```
 
 ### 2 — Python environment
@@ -55,8 +55,7 @@ pip install -r requirements.txt
 ### 3 — Configure
 
 ```bash
-# cp .env.example .env
-nano .env          # set INFERENCE_API_URL to your VLM server
+nano .env          # set INFERENCE_API_URL, SENSOR_WIDTH/HEIGHT if needed
 ```
 
 ### 4 — Run
@@ -71,26 +70,32 @@ Open `http://<rpi-ip>:8000` in a browser.
 ## Install as systemd service
 
 ```bash
-sudo cp drone-inference.service /etc/systemd/system/
+sudo cp robot-inference.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable drone-inference
-sudo systemctl start drone-inference
-sudo journalctl -u drone-inference -f   # follow logs
+sudo systemctl enable robot-inference
+sudo systemctl start robot-inference
+sudo journalctl -u robot-inference -f   # follow logs
 ```
 
 ## Inference API contract
 
-**Request** (POST JSON):
+Uses the **OpenAI-compatible Chat Completions API** with vision:
+
+**Request** (POST JSON to `{INFERENCE_API_URL}/v1/chat/completions`):
 ```json
 {
-  "frames": [
-    { "timestamp": 1741651200.123, "image": "<base64-jpeg>" },
-    { "timestamp": 1741651201.456, "image": "<base64-jpeg>" }
-  ]
+  "model": "<INFERENCE_MODEL>",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "<INFERENCE_PROMPT>"},
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,<b64>"}}
+    ]
+  }]
 }
 ```
 
-**Response** — any JSON object.  
+**Response** — the assistant reply must be a JSON object.  
 Internal keys prefixed with `_` are stripped before display.  
 On error, include an `"error"` key for the UI to show a warning.
 
@@ -98,13 +103,17 @@ On error, include an `"error"` key for the UI to show a warning.
 
 | Variable | Default | Description |
 |---|---|---|
-| `INFERENCE_API_URL` | *(required)* | Remote VLM endpoint |
+| `INFERENCE_API_URL` | *(required)* | Remote VLM endpoint base URL |
+| `INFERENCE_API_KEY` | `none` | Bearer token (use any placeholder if no auth) |
+| `INFERENCE_MODEL` | `llava` | Model name as recognised by the server |
+| `INFERENCE_PROMPT` | *(built-in)* | System/user prompt sent with every request |
 | `INFERENCE_INTERVAL_SEC` | `3` | Seconds between inference calls |
 | `INFERENCE_FRAMES` | `2` | Frames per inference request |
 | `INFERENCE_TIMEOUT_SEC` | `30` | HTTP timeout |
-| `SNAPSHOT_INTERVAL_SEC` | `1.0` | Snapshot cadence |
+| `SNAPSHOT_INTERVAL_SEC` | `1.0` | Snapshot cadence (FPS shown in UI badge) |
 | `SNAPSHOT_BUFFER_SIZE` | `10` | Rolling buffer depth |
-| `CAMERA_WIDTH/HEIGHT` | `640 / 480` | Capture resolution |
+| `SENSOR_WIDTH` / `SENSOR_HEIGHT` | `0` / `0` | Full sensor resolution passed as `--mode` to rpicam-vid for full-FOV capture; `0` = auto |
+| `OUTPUT_WIDTH` / `OUTPUT_HEIGHT` | `640` / `480` | Output resolution (rpicam-vid downscales from sensor mode) |
 | `CAMERA_FRAMERATE` | `30` | Camera framerate |
 | `MJPEG_FPS` | `30` | MJPEG stream rate |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Server bind |

@@ -3,13 +3,3 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-dotenv>=1.0.0
 requests>=2.31.0
-Pillow>=10.0.0
-
-# ── Camera (Raspberry Pi) ─────────────────────────────────────────────────────
-# picamera2 is best installed via apt on Raspberry Pi OS:
-#   sudo apt install python3-picamera2
-#
-# If you're using a venv created with --system-site-packages that includes
-# the apt-managed picamera2, no pip install is needed.
-# Otherwise, as a fallback:
-#   pip install picamera2
