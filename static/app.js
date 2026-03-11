@@ -1,5 +1,6 @@
 /* global state */
 let wsConnected = false;
+let snapshotFps = null;
 const MAX_HISTORY = 50;
 
 const $ = (id) => document.getElementById(id);
@@ -57,7 +58,8 @@ function renderResult(data) {
 
   /* frame badge */
   if (data._frame_count !== undefined) {
-    frameBadge.textContent = `${data._frame_count} frames`;
+    const fpsLabel = snapshotFps !== null ? ` @ ${snapshotFps} FPS` : "";
+    frameBadge.textContent = `${data._frame_count} frames${fpsLabel}`;
     frameBadge.classList.remove("hidden");
   }
 
@@ -172,6 +174,11 @@ function escHtml(str) {
 }
 
 /* ── Boot ──────────────────────────────────────────────────────────────────── */
+fetch("/api/config")
+  .then((r) => r.json())
+  .then((cfg) => { snapshotFps = cfg.snapshot_fps; })
+  .catch(() => {});
+
 connectWS();
 pollStatus();
 setInterval(pollStatus, 5000);

@@ -103,6 +103,11 @@ def create_app(
 
     # ── REST status ───────────────────────────────────────────────────────────
 
+    @app.get("/api/config")
+    def api_config() -> JSONResponse:
+        snapshot_fps = round(1.0 / config.SNAPSHOT_INTERVAL_SEC, 2)
+        return JSONResponse({"snapshot_fps": snapshot_fps})
+
     @app.get("/api/status")
     def api_status() -> JSONResponse:
         return JSONResponse(
