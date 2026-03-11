@@ -32,6 +32,8 @@ def main() -> None:
         framerate=config.CAMERA_FRAMERATE,
         output_width=config.OUTPUT_WIDTH,
         output_height=config.OUTPUT_HEIGHT,
+        sensor_width=config.SENSOR_WIDTH,
+        sensor_height=config.SENSOR_HEIGHT,
     )
 
     snapshot_worker = SnapshotWorker(

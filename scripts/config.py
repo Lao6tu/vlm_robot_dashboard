@@ -10,13 +10,16 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
 # ── Camera ───────────────────────────────────────────────────────────────────
-# Native capture resolution — use the sensor's full/preferred resolution for
-# best image quality.  Frames are resized to OUTPUT_WIDTH×OUTPUT_HEIGHT before
-# being stored as JPEG (used for MJPEG stream, snapshots, and inference).
+# Full sensor resolution — passed to rpicam-vid as --mode W:H so the entire
+# sensor area (full FOV) is captured before downscaling to OUTPUT size.
+# Set to 0 to let rpicam-vid pick the mode automatically.
+SENSOR_WIDTH  = int(os.getenv("SENSOR_WIDTH",  "0"))
+SENSOR_HEIGHT = int(os.getenv("SENSOR_HEIGHT", "0"))
+
 CAMERA_FRAMERATE = int(os.getenv("CAMERA_FRAMERATE", "30"))
 MJPEG_FPS = int(os.getenv("MJPEG_FPS", "30"))
 
-# Output (resized) resolution delivered to the stream and snapshot buffer
+# Output (downscaled) resolution delivered to the stream and snapshot buffer
 OUTPUT_WIDTH  = int(os.getenv("OUTPUT_WIDTH",  "640"))
 OUTPUT_HEIGHT = int(os.getenv("OUTPUT_HEIGHT", "480"))
 
