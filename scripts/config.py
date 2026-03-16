@@ -41,5 +41,13 @@ INFERENCE_INTERVAL_SEC = int(os.getenv("INFERENCE_INTERVAL_SEC", "3"))
 INFERENCE_FRAMES = int(os.getenv("INFERENCE_FRAMES", "2"))   # frames per request
 INFERENCE_TIMEOUT_SEC = int(os.getenv("INFERENCE_TIMEOUT_SEC", "30"))
 
+# ── Live YOLO detection on MJPEG feed ───────────────────────────────────────
+LIVE_DETECTION_ENABLED = os.getenv("LIVE_DETECTION_ENABLED", "1") == "1"
+YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolo26n.pt")
+YOLO_CONF = float(os.getenv("YOLO_CONF", "0.35"))
+YOLO_IOU = float(os.getenv("YOLO_IOU", "0.45"))
+YOLO_INFER_EVERY_N = int(os.getenv("YOLO_INFER_EVERY_N", "2"))
+YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "640"))
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent

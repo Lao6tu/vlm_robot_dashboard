@@ -14,6 +14,7 @@ load_dotenv()
 from scripts import config
 from scripts.camera_manager import CameraManager
 from scripts.inference_scheduler import InferenceScheduler
+from scripts.live_detector import LiveDetector
 from scripts.result_manager import ResultManager
 from scripts.snapshot_worker import SnapshotWorker
 from scripts.web_app import create_app
@@ -54,11 +55,22 @@ def main() -> None:
         timeout_sec=config.INFERENCE_TIMEOUT_SEC,
     )
 
+    live_detector = None
+    if config.LIVE_DETECTION_ENABLED:
+        live_detector = LiveDetector(
+            model_path=config.YOLO_MODEL_PATH,
+            conf=config.YOLO_CONF,
+            iou=config.YOLO_IOU,
+            infer_every_n=config.YOLO_INFER_EVERY_N,
+            imgsz=config.YOLO_IMGSZ,
+        )
+
     app = create_app(
         camera_manager=camera_manager,
         result_manager=result_manager,
         snapshot_worker=snapshot_worker,
         inference_scheduler=inference_scheduler,
+        live_detector=live_detector,
     )
 
     logger.info("Starting Robot Camera Inference server on %s:%d", config.HOST, config.PORT)

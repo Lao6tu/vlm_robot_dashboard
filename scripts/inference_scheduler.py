@@ -34,7 +34,7 @@ import threading
 import time
 from typing import Optional
 
-import requests
+from openai import APITimeoutError, OpenAI, OpenAIError
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,12 @@ class InferenceScheduler:
         self._model = model
         self._prompt = prompt
         self._timeout = timeout_sec
+        self._client: Optional[OpenAI] = None
+        if self._base_url:
+            self._client = OpenAI(
+                api_key=self._api_key,
+                base_url=f"{self._base_url}/v1",
+            )
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -118,30 +124,27 @@ class InferenceScheduler:
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
             })
 
-        payload = {
-            "model": self._model,
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": 256,
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "top_k": 5,
-            "presence_penalty": 1.0,
-            "response_format": {"type": "json_object"},
-            "extra_body": {
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-        }
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-        endpoint = f"{self._base_url}/v1/chat/completions"
+        if not self._client:
+            logger.warning("Inference client not initialized — skipping")
+            return
 
         try:
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=self._timeout)
-            resp.raise_for_status()
-            raw = resp.json()
-        except requests.RequestException as exc:
+            completion = self._client.chat.completions.create(
+                model=self._model,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=256,
+                temperature=0.2,
+                top_p=0.9,
+                presence_penalty=1.0,
+                response_format={"type": "json_object"},
+                extra_body={
+                    "top_k": 5,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                timeout=self._timeout,
+            )
+            raw = completion.model_dump(exclude_none=True)
+        except (OpenAIError, APITimeoutError) as exc:
             logger.error("Inference API error: %s", exc)
             self._results.update_result({
                 "error": str(exc),
@@ -150,11 +153,7 @@ class InferenceScheduler:
             })
             return
 
-        # Extract assistant reply text from the standard OpenAI response shape.
-        try:
-            reply_text = raw["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            reply_text = None
+        reply_text = self._extract_reply_text(raw)
 
         # The model is expected to return a JSON object.  Strip any markdown
         # code-fences (```json ... ```) that VLMs often add, then parse.
@@ -166,9 +165,52 @@ class InferenceScheduler:
             "_model": raw.get("model", self._model),
             "_inferred_at": time.time(),
             "_frame_count": len(snaps),
+            "_raw": raw,
         }
         self._results.update_result(result)
         logger.info("Inference result: %s", str(parsed)[:120])
+
+    @staticmethod
+    def _extract_reply_text(raw: dict) -> str | None:
+        """Extract text from OpenAI-compatible responses with fallback fields."""
+        if not isinstance(raw, dict):
+            return None
+
+        try:
+            choice0 = raw.get("choices", [])[0]
+        except (IndexError, TypeError):
+            choice0 = None
+
+        message = choice0.get("message") if isinstance(choice0, dict) else None
+
+        candidates = []
+        if isinstance(message, dict):
+            candidates.extend([
+                message.get("content"),
+                message.get("reasoning_content"),
+            ])
+        if isinstance(choice0, dict):
+            candidates.append(choice0.get("text"))
+
+        for value in candidates:
+            if isinstance(value, str) and value.strip():
+                return value
+            if isinstance(value, list):
+                chunks = []
+                for item in value:
+                    if isinstance(item, str) and item.strip():
+                        chunks.append(item)
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    text_val = item.get("text") or item.get("content")
+                    if isinstance(text_val, str) and text_val.strip():
+                        chunks.append(text_val)
+                joined = "\n".join(chunks).strip()
+                if joined:
+                    return joined
+
+        return None
 
     @staticmethod
     def _parse_reply(text: str | None) -> dict:

@@ -24,6 +24,7 @@ from fastapi.templating import Jinja2Templates
 from . import config
 from .camera_manager import CameraManager
 from .inference_scheduler import InferenceScheduler
+from .live_detector import LiveDetector
 from .result_manager import ResultManager
 from .snapshot_worker import SnapshotWorker
 
@@ -37,6 +38,7 @@ def create_app(
     result_manager: ResultManager,
     snapshot_worker: Optional[SnapshotWorker] = None,
     inference_scheduler: Optional[InferenceScheduler] = None,
+    live_detector: Optional[LiveDetector] = None,
 ) -> FastAPI:
 
     @asynccontextmanager
@@ -46,6 +48,8 @@ def create_app(
         result_manager.set_event_loop(loop)
 
         camera_manager.start()
+        if live_detector and live_detector.enabled:
+            live_detector.start(camera_manager)
         if snapshot_worker:
             snapshot_worker.start()
         if inference_scheduler:
@@ -58,6 +62,8 @@ def create_app(
             inference_scheduler.stop()
         if snapshot_worker:
             snapshot_worker.stop()
+        if live_detector:
+            live_detector.stop()
         camera_manager.stop()
 
     app = FastAPI(title="Robot Camera Inference Dashboard", lifespan=lifespan)
@@ -144,5 +150,23 @@ def create_app(
             logger.error("WebSocket error: %s", exc)
         finally:
             result_manager.unsubscribe(q)
+
+    @app.websocket("/ws/detections")
+    async def ws_detections(websocket: WebSocket) -> None:
+        await websocket.accept()
+        last_ts = 0.0
+        try:
+            while True:
+                if live_detector and live_detector.enabled:
+                    payload = live_detector.get_latest()
+                    ts = float(payload.get("ts", 0.0))
+                    if ts > last_ts:
+                        last_ts = ts
+                        await websocket.send_text(json.dumps(payload))
+                await asyncio.sleep(0.06)
+        except WebSocketDisconnect:
+            logger.info("Detections WebSocket client disconnected")
+        except Exception as exc:
+            logger.error("Detections WebSocket error: %s", exc)
 
     return app

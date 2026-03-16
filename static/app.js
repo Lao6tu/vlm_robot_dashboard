@@ -9,6 +9,9 @@ const camBadge   = $("cam-status");
 const wsBadge    = $("ws-status");
 const frameBadge = $("frame-badge");
 const mjpeg      = $("mjpeg");
+const detCanvas  = $("det-overlay");
+const detCtx     = detCanvas ? detCanvas.getContext("2d") : null;
+let latestBoxes  = [];
 
 /* ── WebSocket ─────────────────────────────────────────────────────────────── */
 function connectWS() {
@@ -38,6 +41,27 @@ function connectWS() {
   ws.onerror = () => {
     wsBadge.textContent = "WebSocket  ✕";
     wsBadge.className = "badge err";
+  };
+}
+
+/* ── Detections overlay WS ────────────────────────────────────────────────── */
+function connectDetectionsWS() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws/detections`);
+
+  ws.onmessage = (ev) => {
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+    latestBoxes = Array.isArray(data.boxes) ? data.boxes : [];
+    drawDetections();
+  };
+
+  ws.onclose = () => {
+    setTimeout(connectDetectionsWS, 1500);
+  };
+
+  ws.onerror = () => {
+    ws.close();
   };
 }
 
@@ -150,6 +174,7 @@ function pollStatus() {
         camBadge.textContent = "Camera  ○";
         camBadge.className = "badge err";
         $("cam-overlay").classList.remove("hidden");
+        clearDetections();
       }
     })
     .catch(() => {
@@ -158,11 +183,82 @@ function pollStatus() {
     });
 }
 
+function clearDetections() {
+  latestBoxes = [];
+  drawDetections();
+}
+
+function resizeDetectionsCanvas() {
+  if (!detCanvas || !mjpeg) return;
+  const w = mjpeg.clientWidth || 0;
+  const h = mjpeg.clientHeight || 0;
+  if (w <= 0 || h <= 0) return;
+
+  // Match the canvas box to the actual displayed MJPEG box (not the whole wrapper).
+  detCanvas.style.left = `${mjpeg.offsetLeft}px`;
+  detCanvas.style.top = `${mjpeg.offsetTop}px`;
+  detCanvas.style.width = `${w}px`;
+  detCanvas.style.height = `${h}px`;
+
+  const dpr = window.devicePixelRatio || 1;
+  const targetW = Math.max(1, Math.round(w * dpr));
+  const targetH = Math.max(1, Math.round(h * dpr));
+  if (detCanvas.width !== targetW) detCanvas.width = targetW;
+  if (detCanvas.height !== targetH) detCanvas.height = targetH;
+
+  // Draw in CSS pixels while the backing store is scaled for retina displays.
+  detCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function drawDetections() {
+  if (!detCanvas || !detCtx) return;
+  resizeDetectionsCanvas();
+
+  const w = mjpeg.clientWidth || 0;
+  const h = mjpeg.clientHeight || 0;
+  if (w <= 0 || h <= 0) return;
+  detCtx.clearRect(0, 0, w, h);
+  if (!latestBoxes.length) return;
+
+  detCtx.lineWidth = 2;
+  detCtx.font = "13px system-ui, sans-serif";
+
+  for (const b of latestBoxes) {
+    const x1 = Math.max(0, Math.min(w, b.x1 * w));
+    const y1 = Math.max(0, Math.min(h, b.y1 * h));
+    const x2 = Math.max(0, Math.min(w, b.x2 * w));
+    const y2 = Math.max(0, Math.min(h, b.y2 * h));
+    const bw = Math.max(1, x2 - x1);
+    const bh = Math.max(1, y2 - y1);
+
+    detCtx.strokeStyle = "#20d36b";
+    detCtx.strokeRect(x1, y1, bw, bh);
+
+    const label = `${b.label || "obj"} ${(Number(b.conf) || 0).toFixed(2)}`;
+    const tw = detCtx.measureText(label).width;
+    const ty = Math.max(14, y1 - 6);
+    detCtx.fillStyle = "rgba(32, 211, 107, 0.95)";
+    detCtx.fillRect(x1, ty - 14, tw + 10, 16);
+    detCtx.fillStyle = "#08140d";
+    detCtx.fillText(label, x1 + 5, ty - 2);
+  }
+}
+
 /* ── MJPEG error / reconnect ───────────────────────────────────────────────── */
 mjpeg.addEventListener("error", () => {
   setTimeout(() => {
     mjpeg.src = `/stream.mjpeg?_=${Date.now()}`;
   }, 2000);
+});
+
+mjpeg.addEventListener("load", () => {
+  resizeDetectionsCanvas();
+  drawDetections();
+});
+
+window.addEventListener("resize", () => {
+  resizeDetectionsCanvas();
+  drawDetections();
 });
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
@@ -180,5 +276,6 @@ fetch("/api/config")
   .catch(() => {});
 
 connectWS();
+connectDetectionsWS();
 pollStatus();
 setInterval(pollStatus, 5000);
