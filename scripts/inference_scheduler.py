@@ -46,7 +46,7 @@ class InferenceScheduler:
         self,
         snapshot_worker,
         result_manager,
-        interval_sec: int = 3,
+        interval_sec: float = 3,
         frames_per_request: int = 2,
         base_url: str = "",
         api_key: str = "none",
@@ -81,7 +81,7 @@ class InferenceScheduler:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         logger.info(
-            "Inference scheduler started (interval=%d s, frames=%d)",
+            "Inference scheduler started (interval=%.3g s, frames=%d)",
             self._interval,
             self._frames_per_request,
         )
@@ -132,9 +132,9 @@ class InferenceScheduler:
             completion = self._client.chat.completions.create(
                 model=self._model,
                 messages=[{"role": "user", "content": content}],
-                max_tokens=256,
+                max_tokens=512,
                 temperature=0.1,
-                top_p=0.9,
+                top_p=1.0,
                 presence_penalty=0,
                 response_format={"type": "json_object"},
                 extra_body={

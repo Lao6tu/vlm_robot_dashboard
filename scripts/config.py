@@ -5,6 +5,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _decode_env_text(value: str) -> str:
+    return value.encode().decode("unicode_escape")
+
+
+def _load_inference_prompt() -> str:
+    default_prompt = (
+        "You are a robot vision system. Describe what you observe in the image(s) concisely."
+    )
+    prompt_file = os.getenv("INFERENCE_PROMPT_FILE", "").strip()
+    if prompt_file:
+        prompt_path = Path(prompt_file)
+        if not prompt_path.is_absolute():
+            prompt_path = Path(__file__).resolve().parent.parent / prompt_path
+        return prompt_path.read_text(encoding="utf-8").strip()
+
+    return _decode_env_text(os.getenv("INFERENCE_PROMPT", default_prompt))
+
 # ── Server ──────────────────────────────────────────────────────────────────
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
@@ -33,11 +51,8 @@ SNAPSHOT_BUFFER_SIZE = int(os.getenv("SNAPSHOT_BUFFER_SIZE", "10"))
 INFERENCE_API_URL = os.getenv("INFERENCE_API_URL", "http://192.168.1.100:8080")
 INFERENCE_API_KEY = os.getenv("INFERENCE_API_KEY", "none")
 INFERENCE_MODEL = os.getenv("INFERENCE_MODEL", "llava")
-INFERENCE_PROMPT = os.getenv(
-    "INFERENCE_PROMPT",
-    "You are a robot vision system. Describe what you observe in the image(s) concisely.",
-).encode().decode("unicode_escape")
-INFERENCE_INTERVAL_SEC = int(os.getenv("INFERENCE_INTERVAL_SEC", "3"))
+INFERENCE_PROMPT = _load_inference_prompt()
+INFERENCE_INTERVAL_SEC = float(os.getenv("INFERENCE_INTERVAL_SEC", "3"))
 INFERENCE_FRAMES = int(os.getenv("INFERENCE_FRAMES", "2"))   # frames per request
 INFERENCE_TIMEOUT_SEC = int(os.getenv("INFERENCE_TIMEOUT_SEC", "30"))
 
