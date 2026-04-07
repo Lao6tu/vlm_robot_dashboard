@@ -44,7 +44,7 @@ JSON Output:
     "status": {
         "cat": "GO | CAUTION | NO-GO",
         "hazards": "string or none",
-        "free_space": null
+        "free_space": null or number
     },
     "action": "Move Forward | Slow Down | Stop | Steer Right | Steer Left"
 }
