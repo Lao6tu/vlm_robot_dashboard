@@ -1,6 +1,10 @@
 # Robot Vision Inference Dashboard
 
+![Robot Camera Inference Dashboard](images/example.png)
+
 RPi5 robot camera system with a real-time VLM inference pipeline.
+
+This project is open-sourced under the MIT License. See [LICENSE](LICENSE).
 
 ## Architecture
 
@@ -181,3 +185,7 @@ On error, include an `"error"` key for the UI to show a warning.
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | Server bind |
 
 Note: snapshots are currently resized to `960x720` in code before being sent for inference.
+
+## License
+
+This repository is licensed under the MIT License. See [LICENSE](LICENSE) for full text.
