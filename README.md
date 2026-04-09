@@ -1,4 +1,4 @@
-# Robot Camera Inference Dashboard
+# Robot Vision Inference Dashboard
 
 RPi5 robot camera system with a real-time VLM inference pipeline.
 
