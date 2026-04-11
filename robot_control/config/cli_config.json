@@ -7,7 +7,7 @@
   },
   "servo": {
     "init_channel_0": 70,
-    "init_channel_1": 170
+    "init_channel_1": 160
   },
   "ultrasonic": {
     "trigger_pin": 27,
@@ -34,18 +34,23 @@
     "base_speed": 1000,
     "slow_speed": 750,
     "turn_speed": 1200,
-    "steer_phase_sec": 0.8,
+    "steer_phase_sec": 1.0,
     "steer_cooldown_sec": 1.2,
     "control_interval_sec": 0.1,
-    "poll_interval_sec": 0.4,
+    "poll_interval_sec": 0.25,
+    "ultrasonic_poll_interval_sec": 0.1,
     "api_timeout_sec": 1.5,
-    "vlm_stale_timeout_sec": 1.2,
+    "vlm_stale_timeout_sec": 1.5,
     "stop_confirm_count": 2,
-    "recovery_stop_sec": 1.0,
-    "recovery_probe_turn_sec": 0.5,
-    "recovery_pause_sec": 2.0,
-    "recovery_reverse_sec": 1.5,
-    "recovery_turn_sec": 0.6,
-    "recovery_cooldown_sec": 2.0
+    "recovery_stop_sec": 2.0,
+    "ultrasonic_reverse_sec": 1.0,
+    "ultrasonic_turn_min_sec": 0.3,
+    "ultrasonic_turn_max_sec": 1.0,
+    "ultrasonic_wait_sec": 2.0,
+    "vlm_stop_scan_turn_sec": 0.6,
+    "vlm_stop_scan_wait_sec": 2.0,
+    "path_restore_action_sec": 1.0,
+    "path_restore_min_counter_turn_sec": 0.1,
+    "path_restore_assess_sec": 1.5
   }
 }

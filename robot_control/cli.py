@@ -390,11 +390,17 @@ def run_vlm_mode(args: argparse.Namespace, config: dict) -> None:
         caution_cm=max(max(1, args.stop_cm), args.caution_cm),
         stop_confirm_count=max(1, args.stop_confirm_count),
         recovery_stop_sec=max(0.0, args.recovery_stop_sec),
-        recovery_probe_turn_sec=max(0.1, args.recovery_probe_turn_sec),
-        recovery_pause_sec=max(0.0, args.recovery_pause_sec),
-        recovery_reverse_sec=max(0.0, args.recovery_reverse_sec),
-        recovery_turn_sec=max(0.1, args.recovery_turn_sec),
-        recovery_cooldown_sec=max(0.0, args.recovery_cooldown_sec),
+        ultrasonic_reverse_sec=max(0.0, args.ultrasonic_reverse_sec),
+        ultrasonic_turn_min_sec=max(0.0, args.ultrasonic_turn_min_sec),
+        ultrasonic_turn_max_sec=max(0.0, args.ultrasonic_turn_max_sec),
+        ultrasonic_wait_sec=max(0.0, args.ultrasonic_wait_sec),
+        vlm_stop_scan_turn_sec=max(0.1, args.vlm_stop_scan_turn_sec),
+        vlm_stop_scan_wait_sec=max(0.0, args.vlm_stop_scan_wait_sec),
+        path_restore_action_sec=max(0.0, args.path_restore_action_sec),
+        path_restore_min_counter_turn_sec=max(
+            0.0, args.path_restore_min_counter_turn_sec
+        ),
+        path_restore_assess_sec=max(0.0, args.path_restore_assess_sec),
     )
     decision_engine = ActionDecisionEngine(policy=policy)
     controller = VLMMotionController(
@@ -591,53 +597,90 @@ def build_parser(config: dict) -> argparse.ArgumentParser:
         type=float,
         default=vlm_config["recovery_stop_sec"],
         help=(
-            "Continuous confirmed stop duration needed to trigger scan/u-turn recovery "
+            "Continuous confirmed VLM stop duration needed to trigger stop scan "
             f"(default: {vlm_config['recovery_stop_sec']})"
         ),
     )
     vlm_parser.add_argument(
-        "--recovery-probe-turn-sec",
+        "--ultrasonic-reverse-sec",
         type=float,
-        default=vlm_config["recovery_probe_turn_sec"],
+        default=vlm_config["ultrasonic_reverse_sec"],
         help=(
-            "Left/right probe turn duration before reverse recovery "
-            f"(default: {vlm_config['recovery_probe_turn_sec']})"
+            "Reverse duration after ultrasonic trigger "
+            f"(default: {vlm_config['ultrasonic_reverse_sec']})"
         ),
     )
     vlm_parser.add_argument(
-        "--recovery-pause-sec",
+        "--ultrasonic-turn-min-sec",
         type=float,
-        default=vlm_config["recovery_pause_sec"],
+        default=vlm_config["ultrasonic_turn_min_sec"],
         help=(
-            "Shared pause used between recovery steps and probe reassessment "
-            f"(default: {vlm_config['recovery_pause_sec']})"
+            "Minimum random turn duration after ultrasonic reverse "
+            f"(default: {vlm_config['ultrasonic_turn_min_sec']})"
         ),
     )
     vlm_parser.add_argument(
-        "--recovery-reverse-sec",
+        "--ultrasonic-turn-max-sec",
         type=float,
-        default=vlm_config["recovery_reverse_sec"],
+        default=vlm_config["ultrasonic_turn_max_sec"],
         help=(
-            "Recovery reverse duration in seconds "
-            f"(default: {vlm_config['recovery_reverse_sec']})"
+            "Maximum random turn duration after ultrasonic reverse "
+            f"(default: {vlm_config['ultrasonic_turn_max_sec']})"
         ),
     )
     vlm_parser.add_argument(
-        "--recovery-turn-sec",
+        "--ultrasonic-wait-sec",
         type=float,
-        default=vlm_config["recovery_turn_sec"],
+        default=vlm_config["ultrasonic_wait_sec"],
         help=(
-            "Recovery turn duration in seconds "
-            f"(default: {vlm_config['recovery_turn_sec']})"
+            "Stop duration after ultrasonic random turn while waiting for VLM "
+            f"(default: {vlm_config['ultrasonic_wait_sec']})"
         ),
     )
     vlm_parser.add_argument(
-        "--recovery-cooldown-sec",
+        "--vlm-stop-scan-turn-sec",
         type=float,
-        default=vlm_config["recovery_cooldown_sec"],
+        default=vlm_config["vlm_stop_scan_turn_sec"],
         help=(
-            "Recovery cooldown after turn in seconds "
-            f"(default: {vlm_config['recovery_cooldown_sec']})"
+            "Turn duration used when only VLM keeps reporting stop "
+            f"(default: {vlm_config['vlm_stop_scan_turn_sec']})"
+        ),
+    )
+    vlm_parser.add_argument(
+        "--vlm-stop-scan-wait-sec",
+        type=float,
+        default=vlm_config["vlm_stop_scan_wait_sec"],
+        help=(
+            "Stop duration after VLM stop scan turn while waiting for VLM "
+            f"(default: {vlm_config['vlm_stop_scan_wait_sec']})"
+        ),
+    )
+    vlm_parser.add_argument(
+        "--path-restore-action-sec",
+        type=float,
+        default=vlm_config["path_restore_action_sec"],
+        help=(
+            "Duration to follow a passable VLM action during recovery before "
+            "counter-turning back to the original path "
+            f"(default: {vlm_config['path_restore_action_sec']})"
+        ),
+    )
+    vlm_parser.add_argument(
+        "--path-restore-min-counter-turn-sec",
+        type=float,
+        default=vlm_config["path_restore_min_counter_turn_sec"],
+        help=(
+            "Minimum counter-turn duration after path restore action "
+            f"(default: {vlm_config['path_restore_min_counter_turn_sec']})"
+        ),
+    )
+    vlm_parser.add_argument(
+        "--path-restore-assess-sec",
+        type=float,
+        default=vlm_config["path_restore_assess_sec"],
+        help=(
+            "Pause duration after counter-turning to reassess VLM passability "
+            f"(default: {vlm_config['path_restore_assess_sec']})"
         ),
     )
     add_avoidance_args(vlm_parser, config)

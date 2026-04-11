@@ -58,6 +58,7 @@ if str(ROBOT_CONTROL_DIR) not in sys.path:
 PWM = None
 ActionDecisionEngine = None
 MotionPolicy = None
+UltrasonicObstacleSource = None
 VLMAction = None
 VLMActionSource = None
 Servo = None
@@ -67,6 +68,7 @@ try:
     from script.vlm_action_controller import (  # type: ignore
         ActionDecisionEngine,
         MotionPolicy,
+        UltrasonicObstacleSource,
         VLMAction,
         VLMActionSource,
     )
@@ -98,6 +100,11 @@ class DriveModeManager:
         self._mode = "interactive"
         self._last_manual_action = "stop"
         self._last_duties = (0, 0, 0, 0)
+        self._last_arbitration_source = "interactive"
+        self._last_raw_vlm_action: str | None = None
+        self._last_decision_action: str | None = None
+        self._last_ultrasonic_distance_cm: int | None = None
+        self._last_ultrasonic_triggered = False
         self._error: str | None = HARDWARE_IMPORT_ERROR
         self._log_seq = 0
         self._logs: deque[dict[str, Any]] = deque(maxlen=500)
@@ -337,56 +344,105 @@ class DriveModeManager:
             ),
             stop_confirm_count=max(1, int(vlm_cfg.get("stop_confirm_count", 2))),
             recovery_stop_sec=max(0.0, float(vlm_cfg.get("recovery_stop_sec", 1.0))),
-            recovery_probe_turn_sec=max(
-                0.1, float(vlm_cfg.get("recovery_probe_turn_sec", 0.5))
+            ultrasonic_reverse_sec=max(
+                0.0, float(vlm_cfg.get("ultrasonic_reverse_sec", 1.0))
             ),
-            recovery_pause_sec=max(0.0, float(vlm_cfg.get("recovery_pause_sec", 2.0))),
-            recovery_reverse_sec=max(0.0, float(vlm_cfg.get("recovery_reverse_sec", 1.5))),
-            recovery_turn_sec=max(0.1, float(vlm_cfg.get("recovery_turn_sec", 0.6))),
-            recovery_cooldown_sec=max(
-                0.0, float(vlm_cfg.get("recovery_cooldown_sec", 2.0))
+            ultrasonic_turn_min_sec=max(
+                0.0, float(vlm_cfg.get("ultrasonic_turn_min_sec", 0.6))
+            ),
+            ultrasonic_turn_max_sec=max(
+                0.0, float(vlm_cfg.get("ultrasonic_turn_max_sec", 1.2))
+            ),
+            ultrasonic_wait_sec=max(
+                0.0, float(vlm_cfg.get("ultrasonic_wait_sec", 2.0))
+            ),
+            vlm_stop_scan_turn_sec=max(
+                0.1, float(vlm_cfg.get("vlm_stop_scan_turn_sec", 0.6))
+            ),
+            vlm_stop_scan_wait_sec=max(
+                0.0, float(vlm_cfg.get("vlm_stop_scan_wait_sec", 2.0))
+            ),
+            path_restore_action_sec=max(
+                0.0, float(vlm_cfg.get("path_restore_action_sec", 1.0))
+            ),
+            path_restore_min_counter_turn_sec=max(
+                0.0, float(vlm_cfg.get("path_restore_min_counter_turn_sec", 0.1))
+            ),
+            path_restore_assess_sec=max(
+                0.0, float(vlm_cfg.get("path_restore_assess_sec", 0.3))
             ),
         )
         decision_engine = ActionDecisionEngine(policy=policy)
 
         stale_timeout = max(0.1, float(vlm_cfg.get("vlm_stale_timeout_sec", 1.2)))
         loop_interval = max(0.05, float(vlm_cfg.get("control_interval_sec", 0.1)))
+        obstacle_source = UltrasonicObstacleSource(
+            distance_reader=self._read_distance_cm if self._distance_sensor else None,
+            obstacle_trigger_cm=policy.hard_stop_cm,
+            caution_cm=policy.caution_cm,
+            poll_interval_sec=max(
+                0.05,
+                float(vlm_cfg.get("ultrasonic_poll_interval_sec", loop_interval)),
+            ),
+        )
 
         action_source.start()
+        obstacle_source.start()
         last_duties: tuple[int, int, int, int] | None = None
         last_source_err: str | None = None
+        last_obstacle_err: str | None = None
         last_reason: str | None = None
         last_effective: str | None = None
-        last_raw_action: str | None = None
+        last_raw_vlm_action: str | None = None
+        last_arbitration_source: str | None = None
+        last_ultrasonic_triggered: bool | None = None
 
         try:
             while not stop_event.is_set():
                 now = time.monotonic()
-                action, action_age, source_err = action_source.latest()
-                distance_cm = self._read_distance_cm()
+                raw_action, action_age, source_err = action_source.latest()
+                obstacle = obstacle_source.latest()
 
                 stale_action = action_age is None or action_age > stale_timeout
-                allow_recovery = not stale_action
-                if stale_action:
+                allow_recovery = True
+                arbitration_source = "vlm"
+                action = raw_action
+                if obstacle.obstacle_triggered:
                     action = VLMAction.STOP
+                    arbitration_source = "ultrasonic"
+                elif stale_action:
+                    action = VLMAction.STOP
+                    allow_recovery = False
+                    arbitration_source = "vlm_stale"
+
+                distance_cm = obstacle.distance_cm
 
                 duties, reason, effective_action, detail = decision_engine.decide(
                     action=action,
                     distance_cm=distance_cm,
                     now_mono=now,
                     allow_recovery=allow_recovery,
+                    ultrasonic_triggered=obstacle.obstacle_triggered,
                 )
 
-                raw_action_text = action.value if action else "none"
+                raw_vlm_action_text = raw_action.value if raw_action else "none"
+                decision_action_text = action.value if action else "none"
                 effective_action_text = effective_action.value
                 state_changed = (
                     duties != last_duties
                     or reason != last_reason
                     or effective_action_text != last_effective
-                    or raw_action_text != last_raw_action
+                    or raw_vlm_action_text != last_raw_vlm_action
+                    or arbitration_source != last_arbitration_source
+                    or obstacle.obstacle_triggered != last_ultrasonic_triggered
                 )
 
                 with self._lock:
+                    self._last_arbitration_source = arbitration_source
+                    self._last_raw_vlm_action = raw_vlm_action_text
+                    self._last_decision_action = decision_action_text
+                    self._last_ultrasonic_distance_cm = distance_cm
+                    self._last_ultrasonic_triggered = obstacle.obstacle_triggered
                     if self._mode == "vlm" and duties != last_duties:
                         self._set_motor(duties)
                     if self._mode == "vlm" and state_changed:
@@ -394,18 +450,25 @@ class DriveModeManager:
                             level="INFO",
                             mode="vlm",
                             message="VLM state update",
-                            raw_action=raw_action_text,
+                            arbitration_source=arbitration_source,
+                            raw_vlm_action=raw_vlm_action_text,
+                            decision_action=decision_action_text,
                             effective_action=effective_action_text,
                             reason=reason,
                             duties=list(duties),
                             distance_cm=distance_cm,
+                            distance_age_sec=obstacle.age_sec,
+                            ultrasonic_triggered=obstacle.obstacle_triggered,
+                            ultrasonic_caution=obstacle.caution_triggered,
                             detail=detail,
                         )
 
                 last_duties = duties
                 last_reason = reason
                 last_effective = effective_action_text
-                last_raw_action = raw_action_text
+                last_raw_vlm_action = raw_vlm_action_text
+                last_arbitration_source = arbitration_source
+                last_ultrasonic_triggered = obstacle.obstacle_triggered
 
                 if source_err and source_err != last_source_err:
                     logger.warning("VLM status source error: %s", source_err)
@@ -424,6 +487,24 @@ class DriveModeManager:
                             message="VLM status source recovered",
                         )
                 last_source_err = source_err
+
+                if obstacle.error and obstacle.error != last_obstacle_err:
+                    logger.warning("Ultrasonic source error: %s", obstacle.error)
+                    with self._lock:
+                        self._append_log(
+                            level="WARNING",
+                            mode="vlm",
+                            message="Ultrasonic source error",
+                            error=obstacle.error,
+                        )
+                if not obstacle.error and last_obstacle_err:
+                    with self._lock:
+                        self._append_log(
+                            level="INFO",
+                            mode="vlm",
+                            message="Ultrasonic source recovered",
+                        )
+                last_obstacle_err = obstacle.error
 
                 stop_event.wait(loop_interval)
         except Exception as exc:
@@ -447,6 +528,7 @@ class DriveModeManager:
                     mode="vlm",
                     message="VLM drive loop exited",
                 )
+            obstacle_source.stop()
             action_source.stop()
 
     def switch_mode(self, mode: str) -> dict[str, Any]:
@@ -459,6 +541,7 @@ class DriveModeManager:
             self._stop_vlm_locked()
             self._set_motor((0, 0, 0, 0))
             self._last_manual_action = "stop"
+            self._last_arbitration_source = mode
 
             self._mode = mode
             if mode == "vlm":
@@ -483,6 +566,7 @@ class DriveModeManager:
             duties = self._duties_for_action(action)
             self._set_motor(duties)
             self._last_manual_action = action
+            self._last_arbitration_source = "interactive"
             self._append_log(
                 level="INFO",
                 mode="interactive",
@@ -499,6 +583,11 @@ class DriveModeManager:
             "vlm_running": bool(self._vlm_thread and self._vlm_thread.is_alive()),
             "last_manual_action": self._last_manual_action,
             "last_duties": list(self._last_duties),
+            "last_arbitration_source": self._last_arbitration_source,
+            "last_raw_vlm_action": self._last_raw_vlm_action,
+            "last_decision_action": self._last_decision_action,
+            "last_ultrasonic_distance_cm": self._last_ultrasonic_distance_cm,
+            "last_ultrasonic_triggered": self._last_ultrasonic_triggered,
             "last_servo_angles": list(self._last_servo_angles) if self._last_servo_angles else None,
             "error": self._error,
             "log_count": len(self._logs),

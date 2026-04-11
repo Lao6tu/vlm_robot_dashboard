@@ -2,20 +2,21 @@
 """
 VLM Action Motion Controller
 ===========================
-Non-blocking motion controller that consumes latest VLM inference JSON from
-the inference dashboard API (/api/status), extracts a navigation action, and
-combines it with ultrasonic distance constraints.
+Non-blocking motion controller with separate monitoring channels for VLM
+inference output and ultrasonic obstacle triggers.
 
 Priority order:
-1) Hard safety: very close obstacle -> forced stop
-2) Near constraint: close obstacle -> limit speed / block forward rush
-3) VLM direction: forward / slow down / stop / steer left / steer right
-4) Recovery: sustained stop under near-distance -> perform scan/u-turn
+1) Ultrasonic obstacle trigger -> reverse, random turn, wait for VLM
+2) Active path restore after VLM-only stop scan
+3) VLM direction, only when ultrasonic is not triggered
+4) Near-distance caution -> limit speed / block forward rush
+5) Sustained VLM stop -> simple scan turn and path restore
 """
 
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -194,6 +195,87 @@ class VLMActionSource:
         return extract_action_from_result(result)
 
 
+@dataclass(frozen=True)
+class UltrasonicObstacleReading:
+    distance_cm: int | None = None
+    obstacle_triggered: bool = False
+    caution_triggered: bool = False
+    age_sec: float | None = None
+    error: str | None = None
+
+
+class UltrasonicObstacleSource:
+    """Polls ultrasonic distance in its own channel and exposes trigger state."""
+
+    def __init__(
+        self,
+        *,
+        distance_reader: Callable[[], int | None] | None,
+        obstacle_trigger_cm: int,
+        caution_cm: int,
+        poll_interval_sec: float = 0.1,
+    ) -> None:
+        self._distance_reader = distance_reader
+        self._obstacle_trigger_cm = max(1, obstacle_trigger_cm)
+        self._caution_cm = max(self._obstacle_trigger_cm, caution_cm)
+        self._poll_interval_sec = max(0.05, poll_interval_sec)
+
+        self._lock = threading.Lock()
+        self._latest_distance_cm: int | None = None
+        self._latest_update_mono: float | None = None
+        self._latest_error: str | None = None
+
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._running or self._distance_reader is None:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    def latest(self) -> UltrasonicObstacleReading:
+        with self._lock:
+            age = None
+            if self._latest_update_mono is not None:
+                age = max(0.0, time.monotonic() - self._latest_update_mono)
+            distance_cm = self._latest_distance_cm
+            return UltrasonicObstacleReading(
+                distance_cm=distance_cm,
+                obstacle_triggered=(
+                    distance_cm is not None
+                    and distance_cm <= self._obstacle_trigger_cm
+                ),
+                caution_triggered=(
+                    distance_cm is not None and distance_cm <= self._caution_cm
+                ),
+                age_sec=age,
+                error=self._latest_error,
+            )
+
+    def _run(self) -> None:
+        while self._running:
+            t0 = time.monotonic()
+            try:
+                distance_cm = self._distance_reader() if self._distance_reader else None
+                with self._lock:
+                    self._latest_distance_cm = distance_cm
+                    self._latest_update_mono = time.monotonic()
+                    self._latest_error = None
+            except Exception as exc:
+                with self._lock:
+                    self._latest_error = str(exc)
+
+            elapsed = time.monotonic() - t0
+            time.sleep(max(0.0, self._poll_interval_sec - elapsed))
+
+
 @dataclass
 class MotionPolicy:
     base_speed: int = 1400
@@ -205,15 +287,19 @@ class MotionPolicy:
     caution_cm: int = 28
     stop_confirm_count: int = 1
     recovery_stop_sec: float = 0.2
-    recovery_probe_turn_sec: float = 0.5
-    recovery_pause_sec: float = 0.5
-    recovery_reverse_sec: float = 0.3
-    recovery_turn_sec: float = 0.8
-    recovery_cooldown_sec: float = 1.5
+    ultrasonic_reverse_sec: float = 1.0
+    ultrasonic_turn_min_sec: float = 0.6
+    ultrasonic_turn_max_sec: float = 1.2
+    ultrasonic_wait_sec: float = 2.0
+    vlm_stop_scan_turn_sec: float = 0.6
+    vlm_stop_scan_wait_sec: float = 2.0
+    path_restore_action_sec: float = 1.0
+    path_restore_min_counter_turn_sec: float = 0.1
+    path_restore_assess_sec: float = 0.3
 
 
 class ActionDecisionEngine:
-    """Stateful policy engine for action debounce, safety constraints, and recovery."""
+    """Stateful policy engine for simple obstacle escape and VLM path restore."""
 
     def __init__(self, policy: MotionPolicy) -> None:
         self.policy = policy
@@ -226,23 +312,24 @@ class ActionDecisionEngine:
         self._last_steer_action: VLMAction | None = None
         self._steer_cooldown_until = 0.0
 
-        self._probe_left_until = 0.0
-        self._probe_pause_until = 0.0
-        self._probe_right_until = 0.0
-        self._probe_assess_until = 0.0
-        self._probe_source: str | None = None
+        self._ultrasonic_reverse_until = 0.0
+        self._ultrasonic_turn_until = 0.0
+        self._ultrasonic_wait_until = 0.0
+        self._ultrasonic_turn_direction: str | None = None
+        self._ultrasonic_turn_sec = 0.0
 
-        self._recovery_reverse_until = 0.0
-        self._recovery_left_turn_until = 0.0
-        self._recovery_mid_pause_until = 0.0
-        self._recovery_right_turn_until = 0.0
-        self._recovery_settle_until = 0.0
-        self._recovery_final_right_until = 0.0
-        self._recovery_cooldown_until = 0.0
-        self._recovery_reverse_duties: DutyTuple = (0, 0, 0, 0)
-        self._recovery_left_turn_duties: DutyTuple = (0, 0, 0, 0)
-        self._recovery_right_turn_duties: DutyTuple = (0, 0, 0, 0)
-        self._recovery_source: str | None = None
+        self._vlm_scan_turn_until = 0.0
+        self._vlm_scan_wait_until = 0.0
+        self._vlm_scan_direction: str | None = None
+        self._vlm_scan_turn_sec = 0.0
+
+        self._path_restore_action_until = 0.0
+        self._path_restore_counter_until = 0.0
+        self._path_restore_assess_until = 0.0
+        self._path_restore_action: VLMAction | None = None
+        self._path_restore_counter_direction: str | None = None
+        self._path_restore_source_phase: str | None = None
+        self._path_restore_counter_sec = 0.0
 
     def decide(
         self,
@@ -250,58 +337,51 @@ class ActionDecisionEngine:
         distance_cm: int | None,
         now_mono: float,
         allow_recovery: bool = True,
+        ultrasonic_triggered: bool = False,
     ) -> tuple[DutyTuple, str, VLMAction, str]:
-        probe_interrupt = self._interrupt_probe_on_new_action(action, now_mono)
-        if probe_interrupt is not None:
-            return probe_interrupt
-
-        recovery_followup = self._continue_post_recovery_fallback(
-            action=action,
-            now_mono=now_mono,
-            allow_recovery=allow_recovery,
-        )
-        if recovery_followup is not None:
-            return recovery_followup
-        self._clear_completed_recovery(now_mono)
-
-        recovery_followup = self._continue_post_probe_recovery(
-            action=action,
-            now_mono=now_mono,
-            allow_recovery=allow_recovery,
-        )
-        if recovery_followup is not None:
-            return recovery_followup
-
-        recovery_duties, recovery_detail = self._get_recovery_phase(now_mono)
-        if recovery_duties is not None:
-            return recovery_duties, "recovery_u_turn", self._last_action, recovery_detail
-
-        if distance_cm is not None and distance_cm <= self.policy.hard_stop_cm:
+        if ultrasonic_triggered:
             self._reset_steer_phase()
-            self._last_action = VLMAction.STOP
+            self._reset_sustained_stop()
             self._pending_stop_count = 0
-            stop_duration = self._mark_sustained_stop(now_mono)
-            detail_parts = [
-                f"distance={distance_cm}cm <= hard_stop_cm={self.policy.hard_stop_cm}cm",
-                "hard_stop_duration="
-                f"{stop_duration:.2f}/{self.policy.recovery_stop_sec:.2f}s",
-            ]
-            if (
-                allow_recovery
-                and stop_duration >= self.policy.recovery_stop_sec
-                and now_mono >= self._recovery_cooldown_until
-            ):
-                detail_parts.append(self._start_probe_recovery(now_mono, from_hard_stop=True))
-                return (
-                    self._probe_turn_duties("left"),
-                    "hard_stop_probe_triggered",
-                    VLMAction.STOP,
-                    "; ".join(detail_parts),
-                )
-            if now_mono < self._recovery_cooldown_until:
-                cooldown_left = self._recovery_cooldown_until - now_mono
-                detail_parts.append(f"recovery_cooldown={cooldown_left:.2f}s")
-            return (0, 0, 0, 0), "hard_safety_stop", VLMAction.STOP, "; ".join(detail_parts)
+            self._clear_path_restore()
+            self._clear_vlm_stop_scan()
+            if not self._ultrasonic_escape_active(now_mono):
+                self._start_ultrasonic_escape(now_mono)
+            phase = self._get_ultrasonic_escape_phase(now_mono)
+            if phase is not None:
+                return phase
+
+        if self._ultrasonic_escape_active(now_mono):
+            if self._ultrasonic_wait_active(now_mono) and self._is_passable_action(action):
+                self._clear_ultrasonic_escape()
+            else:
+                phase = self._get_ultrasonic_escape_phase(now_mono)
+                if phase is not None:
+                    return phase
+                self._clear_ultrasonic_escape()
+
+        path_restore_followup = self._continue_path_restore(
+            action=action,
+            now_mono=now_mono,
+        )
+        if path_restore_followup is not None:
+            return path_restore_followup
+
+        path_restore_start = self._start_path_restore_if_passable(
+            action=action,
+            now_mono=now_mono,
+            allow_recovery=allow_recovery,
+        )
+        if path_restore_start is not None:
+            return path_restore_start
+
+        vlm_scan_phase = self._continue_vlm_stop_scan(
+            action=action,
+            now_mono=now_mono,
+            allow_recovery=allow_recovery,
+        )
+        if vlm_scan_phase is not None:
+            return vlm_scan_phase
 
         effective, debounce_detail = self._resolve_action_with_stop_debounce(action)
         effective, steer_cooldown_detail = self._apply_steer_cooldown(
@@ -335,18 +415,11 @@ class ActionDecisionEngine:
                 "sustained_stop_duration="
                 f"{stop_duration:.2f}/{self.policy.recovery_stop_sec:.2f}s"
             )
-            if (
-                allow_recovery
-                and stop_duration >= self.policy.recovery_stop_sec
-                and now_mono >= self._recovery_cooldown_until
-            ):
-                detail_parts.append(self._start_probe_recovery(now_mono, from_hard_stop=False))
-                return (
-                    self._probe_turn_duties("left"),
-                    "probe_triggered",
-                    VLMAction.STOP,
-                    "; ".join(detail_parts),
-                )
+            if allow_recovery and stop_duration >= self.policy.recovery_stop_sec:
+                self._start_vlm_stop_scan(now_mono)
+                phase = self._get_vlm_stop_scan_phase(now_mono)
+                if phase is not None:
+                    return phase
         else:
             self._reset_sustained_stop()
 
@@ -361,6 +434,127 @@ class ActionDecisionEngine:
             detail_parts.append(motion_detail)
         detail_parts.append(f"effective={effective.value}")
         return duties, reason, effective, "; ".join(detail_parts)
+
+    def _start_ultrasonic_escape(self, now_mono: float) -> None:
+        self._clear_vlm_stop_scan()
+        self._clear_path_restore()
+        reverse_sec = max(0.0, self.policy.ultrasonic_reverse_sec)
+        turn_min = max(0.0, self.policy.ultrasonic_turn_min_sec)
+        turn_max = max(turn_min, self.policy.ultrasonic_turn_max_sec)
+        turn_sec = random.uniform(turn_min, turn_max)
+        direction = random.choice(("left", "right"))
+        wait_sec = max(0.0, self.policy.ultrasonic_wait_sec)
+
+        self._ultrasonic_reverse_until = now_mono + reverse_sec
+        self._ultrasonic_turn_until = self._ultrasonic_reverse_until + turn_sec
+        self._ultrasonic_wait_until = self._ultrasonic_turn_until + wait_sec
+        self._ultrasonic_turn_direction = direction
+        self._ultrasonic_turn_sec = turn_sec
+        self._last_action = VLMAction.STOP
+
+    def _get_ultrasonic_escape_phase(
+        self,
+        now_mono: float,
+    ) -> tuple[DutyTuple, str, VLMAction, str] | None:
+        if not self._ultrasonic_escape_active(now_mono):
+            return None
+
+        if now_mono < self._ultrasonic_reverse_until:
+            remaining = max(0.0, self._ultrasonic_reverse_until - now_mono)
+            speed = max(0, min(4095, self.policy.slow_speed))
+            detail = (
+                "ultrasonic_phase=reverse "
+                f"remaining={remaining:.2f}s "
+                f"reverse_sec={self.policy.ultrasonic_reverse_sec:.2f}s"
+            )
+            return (-speed, -speed, -speed, -speed), "ultrasonic_escape_reverse", VLMAction.STOP, detail
+
+        if now_mono < self._ultrasonic_turn_until:
+            direction = self._ultrasonic_turn_direction or "left"
+            remaining = max(0.0, self._ultrasonic_turn_until - now_mono)
+            detail = (
+                "ultrasonic_phase=random_turn "
+                f"direction={direction} remaining={remaining:.2f}s "
+                f"turn_sec={self._ultrasonic_turn_sec:.2f}s"
+            )
+            return self._turn_duties(direction), "ultrasonic_escape_random_turn", VLMAction.STOP, detail
+
+        if now_mono < self._ultrasonic_wait_until:
+            remaining = max(0.0, self._ultrasonic_wait_until - now_mono)
+            detail = (
+                "ultrasonic_phase=wait_vlm "
+                f"remaining={remaining:.2f}s "
+                f"wait_sec={self.policy.ultrasonic_wait_sec:.2f}s"
+            )
+            return (0, 0, 0, 0), "ultrasonic_escape_wait_vlm", VLMAction.STOP, detail
+
+        return None
+
+    def _continue_vlm_stop_scan(
+        self,
+        action: VLMAction | None,
+        now_mono: float,
+        allow_recovery: bool,
+    ) -> tuple[DutyTuple, str, VLMAction, str] | None:
+        if not self._vlm_stop_scan_active(now_mono):
+            if self._vlm_scan_wait_until > 0.0:
+                self._clear_vlm_stop_scan()
+            return None
+
+        if self._is_passable_action(action):
+            return None
+
+        phase = self._get_vlm_stop_scan_phase(now_mono)
+        if phase is not None:
+            return phase
+
+        self._clear_vlm_stop_scan()
+        if allow_recovery and action == VLMAction.STOP:
+            self._start_vlm_stop_scan(now_mono)
+            return self._get_vlm_stop_scan_phase(now_mono)
+        return None
+
+    def _start_vlm_stop_scan(self, now_mono: float) -> None:
+        self._clear_ultrasonic_escape()
+        self._clear_path_restore()
+        turn_sec = max(0.1, self.policy.vlm_stop_scan_turn_sec)
+        wait_sec = max(0.0, self.policy.vlm_stop_scan_wait_sec)
+        direction = random.choice(("left", "right"))
+        self._vlm_scan_turn_until = now_mono + turn_sec
+        self._vlm_scan_wait_until = self._vlm_scan_turn_until + wait_sec
+        self._vlm_scan_direction = direction
+        self._vlm_scan_turn_sec = turn_sec
+        self._reset_sustained_stop()
+        self._pending_stop_count = 0
+        self._last_action = VLMAction.STOP
+
+    def _get_vlm_stop_scan_phase(
+        self,
+        now_mono: float,
+    ) -> tuple[DutyTuple, str, VLMAction, str] | None:
+        if not self._vlm_stop_scan_active(now_mono):
+            return None
+
+        direction = self._vlm_scan_direction or "left"
+        if now_mono < self._vlm_scan_turn_until:
+            remaining = max(0.0, self._vlm_scan_turn_until - now_mono)
+            detail = (
+                "vlm_stop_scan_phase=turn "
+                f"direction={direction} remaining={remaining:.2f}s "
+                f"turn_sec={self._vlm_scan_turn_sec:.2f}s"
+            )
+            return self._turn_duties(direction), "vlm_stop_scan_turn", VLMAction.STOP, detail
+
+        if now_mono < self._vlm_scan_wait_until:
+            remaining = max(0.0, self._vlm_scan_wait_until - now_mono)
+            detail = (
+                "vlm_stop_scan_phase=wait_passable "
+                f"direction={direction} remaining={remaining:.2f}s "
+                f"wait_sec={self.policy.vlm_stop_scan_wait_sec:.2f}s"
+            )
+            return (0, 0, 0, 0), "vlm_stop_scan_wait", VLMAction.STOP, detail
+
+        return None
 
     def _resolve_action_with_stop_debounce(
         self,
@@ -415,218 +609,226 @@ class ActionDecisionEngine:
             "fallback=Move Forward"
         )
 
-    def _start_recovery(self, now_mono: float, from_hard_stop: bool) -> str:
-        self._reset_steer_phase()
-        self._clear_probe_recovery()
+    def _is_passable_action(self, action: VLMAction | None) -> bool:
+        return action is not None and action != VLMAction.STOP
 
-        reverse_speed = max(0, min(4095, self.policy.slow_speed))
-        self._recovery_left_turn_duties = self._probe_turn_duties("left")
-        self._recovery_right_turn_duties = self._probe_turn_duties("right")
-
-        self._recovery_reverse_duties = (
-            -reverse_speed,
-            -reverse_speed,
-            -reverse_speed,
-            -reverse_speed,
-        )
-
-        reverse_sec = max(0.0, self.policy.recovery_reverse_sec)
-        turn_sec = max(0.1, self.policy.recovery_turn_sec)
-        pause_sec = max(0.0, self.policy.recovery_pause_sec)
-        self._recovery_reverse_until = now_mono + reverse_sec
-        self._recovery_left_turn_until = self._recovery_reverse_until + turn_sec
-        self._recovery_mid_pause_until = self._recovery_left_turn_until + pause_sec
-        self._recovery_right_turn_until = self._recovery_mid_pause_until + turn_sec
-        self._recovery_settle_until = self._recovery_right_turn_until + pause_sec
-
-        self._recovery_source = "hard_stop" if from_hard_stop else "sustained_stop"
-        self._last_action = VLMAction.STOP
-
-        self._recovery_cooldown_until = (
-            self._recovery_settle_until + max(0.0, self.policy.recovery_cooldown_sec)
-        )
-        self._reset_sustained_stop()
-        self._pending_stop_count = 0
-
-        source = self._recovery_source
-        return (
-            f"triggered_recovery source={source} "
-            f"reverse_sec={reverse_sec:.2f} left_sec={turn_sec:.2f} "
-            f"pause_sec={pause_sec:.2f} right_sec={turn_sec:.2f} "
-            f"final_pause_sec={pause_sec:.2f}"
-        )
-
-    def _start_probe_recovery(self, now_mono: float, from_hard_stop: bool) -> str:
-        self._reset_steer_phase()
-        probe_left_sec = max(0.1, self.policy.recovery_probe_turn_sec)
-        probe_right_sec = probe_left_sec * 2.0
-        probe_pause_sec = max(0.0, self.policy.recovery_pause_sec)
-        self._probe_left_until = now_mono + probe_left_sec
-        self._probe_pause_until = self._probe_left_until + probe_pause_sec
-        self._probe_right_until = self._probe_pause_until + probe_right_sec
-        self._probe_assess_until = self._probe_right_until + probe_pause_sec
-        self._probe_source = "hard_stop" if from_hard_stop else "sustained_stop"
-        self._last_action = VLMAction.STOP
-        self._reset_sustained_stop()
-        self._pending_stop_count = 0
-        return (
-            f"triggered_probe_recovery source={self._probe_source} "
-            f"left_sec={probe_left_sec:.2f} pause_sec={probe_pause_sec:.2f} "
-            f"right_sec={probe_right_sec:.2f} assess_sec={probe_pause_sec:.2f}"
-        )
-
-    def _continue_post_probe_recovery(
+    def _start_path_restore_if_passable(
         self,
         action: VLMAction | None,
         now_mono: float,
         allow_recovery: bool,
     ) -> tuple[DutyTuple, str, VLMAction, str] | None:
-        if not self._probe_pending_followup(now_mono):
+        if not allow_recovery or not self._is_passable_action(action):
             return None
 
-        source = self._probe_source or "unknown"
-        if allow_recovery and action == VLMAction.STOP:
-            detail = (
-                f"probe_complete source={source}; "
-                f"{self._start_recovery(now_mono, from_hard_stop=source == 'hard_stop')}"
-            )
-            return (
-                self._recovery_reverse_duties,
-                "probe_failed_recovery_triggered",
-                VLMAction.STOP,
-                detail,
-            )
+        context = self._active_path_restore_context(now_mono)
+        if context is None or action is None:
+            return None
 
-        detail = (
-            f"probe_complete source={source}; "
-            f"probe_cleared next_action={action.value if action else 'none'}"
+        phase, direction, turn_elapsed, source = context
+        self._start_path_restore(
+            action=action,
+            now_mono=now_mono,
+            turn_direction=direction,
+            turn_elapsed=turn_elapsed,
+            source_phase=phase,
         )
-        self._clear_probe_recovery()
-        return None if action is not None else (
-            (0, 0, 0, 0),
-            "probe_complete_waiting_action",
-            VLMAction.STOP,
-            detail,
-        )
-
-    def _continue_post_recovery_fallback(
-        self,
-        action: VLMAction | None,
-        now_mono: float,
-        allow_recovery: bool,
-    ) -> tuple[DutyTuple, str, VLMAction, str] | None:
-        if not self._recovery_pending_fallback(now_mono):
-            return None
-
-        source = self._recovery_source or "unknown"
-        if allow_recovery and action == VLMAction.STOP:
-            detail = self._start_final_right_fallback(now_mono, source)
-            return (
-                self._probe_turn_duties("right"),
-                "recovery_failed_final_right_triggered",
-                VLMAction.STOP,
-                detail,
-            )
-
-        self._clear_recovery_tracking()
-        if action is not None:
-            return None
-        return (
-            (0, 0, 0, 0),
-            "recovery_complete_waiting_action",
-            VLMAction.STOP,
-            f"recovery_complete source={source}; next_action=none",
-        )
-
-    def _interrupt_probe_on_new_action(
-        self,
-        action: VLMAction | None,
-        now_mono: float,
-    ) -> tuple[DutyTuple, str, VLMAction, str] | None:
-        if action is None or action == VLMAction.STOP or self._probe_source is None:
-            return None
-
-        phase = self._probe_interrupt_phase(now_mono)
-        if phase is None:
-            return None
-
-        source = self._probe_source
-        self._clear_probe_recovery()
-        self._reset_sustained_stop()
-        self._pending_stop_count = 0
-
         duties, motion_detail = self._duties_for_action(
             action,
             near_distance=False,
             now_mono=now_mono,
         )
         self._remember_effective_action(action, now_mono)
-
         detail_parts = [
-            f"probe_interrupted source={source} phase={phase}",
-            f"vlm_action={action.value}",
+            f"path_restore_start source={source} phase={phase}",
+            f"detected_action={action.value}",
+            f"turn_direction={direction}",
+            f"counter_direction={self._path_restore_counter_direction}",
+            f"action_sec={self.policy.path_restore_action_sec:.2f}",
+            f"counter_sec={self._path_restore_counter_sec:.2f}",
         ]
         if motion_detail:
             detail_parts.append(motion_detail)
-        detail_parts.append(f"effective={action.value}")
-        return duties, "probe_interrupted_by_vlm_action", action, "; ".join(detail_parts)
+        return duties, "path_restore_action", action, "; ".join(detail_parts)
 
-    def _probe_pending_followup(self, now_mono: float) -> bool:
-        return (
-            self._probe_source is not None
-            and self._probe_left_until > 0.0
-            and now_mono >= self._probe_assess_until
-        )
+    def _continue_path_restore(
+        self,
+        action: VLMAction | None,
+        now_mono: float,
+    ) -> tuple[DutyTuple, str, VLMAction, str] | None:
+        if not self._path_restore_active():
+            return None
 
-    def _recovery_pending_fallback(self, now_mono: float) -> bool:
-        return (
-            self._recovery_source is not None
-            and self._recovery_settle_until > 0.0
-            and self._recovery_final_right_until == 0.0
-            and now_mono >= self._recovery_settle_until
-        )
+        active_phase = self._get_path_restore_phase(now_mono)
+        if active_phase is not None:
+            return active_phase
 
-    def _clear_probe_recovery(self) -> None:
-        self._probe_left_until = 0.0
-        self._probe_pause_until = 0.0
-        self._probe_right_until = 0.0
-        self._probe_assess_until = 0.0
-        self._probe_source = None
+        source_phase = self._path_restore_source_phase or "unknown"
+        if self._is_passable_action(action) and action is not None:
+            self._clear_vlm_stop_scan()
+            self._clear_path_restore()
+            self._reset_sustained_stop()
+            self._pending_stop_count = 0
 
-    def _clear_recovery_tracking(self) -> None:
-        self._recovery_reverse_until = 0.0
-        self._recovery_left_turn_until = 0.0
-        self._recovery_mid_pause_until = 0.0
-        self._recovery_right_turn_until = 0.0
-        self._recovery_settle_until = 0.0
-        self._recovery_final_right_until = 0.0
-        self._recovery_reverse_duties = (0, 0, 0, 0)
-        self._recovery_left_turn_duties = (0, 0, 0, 0)
-        self._recovery_right_turn_duties = (0, 0, 0, 0)
-        self._recovery_source = None
+            duties, motion_detail = self._duties_for_action(
+                action,
+                near_distance=False,
+                now_mono=now_mono,
+            )
+            self._remember_effective_action(action, now_mono)
+            detail_parts = [
+                f"path_restore_confirmed source_phase={source_phase}",
+                f"next_action={action.value}",
+            ]
+            if motion_detail:
+                detail_parts.append(motion_detail)
+            return (
+                duties,
+                "path_restore_passable_confirmed",
+                action,
+                "; ".join(detail_parts),
+            )
 
-    def _start_final_right_fallback(self, now_mono: float, source: str) -> str:
-        final_right_sec = max(0.1, self.policy.recovery_turn_sec * 2.0)
-        self._recovery_final_right_until = now_mono + final_right_sec
-        return (
-            f"recovery_complete source={source}; "
-            f"triggered_final_right right_sec={final_right_sec:.2f}"
-        )
-
-    def _clear_completed_recovery(self, now_mono: float) -> None:
-        if (
-            self._recovery_source is not None
-            and self._recovery_final_right_until > 0.0
-            and now_mono >= self._recovery_final_right_until
-        ):
-            self._clear_recovery_tracking()
-
-    def _probe_interrupt_phase(self, now_mono: float) -> str | None:
-        if self._probe_left_until > 0.0 and now_mono < self._probe_pause_until:
-            return "probe_pause"
-        if self._probe_right_until > 0.0 and now_mono < self._probe_assess_until:
-            return "probe_assess"
+        self._clear_path_restore()
+        self._last_action = VLMAction.STOP
         return None
+
+    def _start_path_restore(
+        self,
+        *,
+        action: VLMAction,
+        now_mono: float,
+        turn_direction: str,
+        turn_elapsed: float,
+        source_phase: str,
+    ) -> None:
+        action_sec = max(0.0, self.policy.path_restore_action_sec)
+        min_counter_sec = max(0.0, self.policy.path_restore_min_counter_turn_sec)
+        counter_sec = max(min_counter_sec, turn_elapsed)
+        counter_sec = min(max(0.0, counter_sec), self._max_counter_turn_sec(source_phase))
+        assess_sec = max(0.0, self.policy.path_restore_assess_sec)
+
+        self._path_restore_action = action
+        self._path_restore_counter_direction = (
+            "right" if turn_direction == "left" else "left"
+        )
+        self._path_restore_source_phase = source_phase
+        self._path_restore_counter_sec = counter_sec
+        self._path_restore_action_until = now_mono + action_sec
+        self._path_restore_counter_until = self._path_restore_action_until + counter_sec
+        self._path_restore_assess_until = self._path_restore_counter_until + assess_sec
+
+    def _get_path_restore_phase(
+        self,
+        now_mono: float,
+    ) -> tuple[DutyTuple, str, VLMAction, str] | None:
+        action = self._path_restore_action
+        if action is None:
+            return None
+
+        if now_mono < self._path_restore_action_until:
+            remaining = max(0.0, self._path_restore_action_until - now_mono)
+            duties, motion_detail = self._duties_for_action(
+                action,
+                near_distance=False,
+                now_mono=now_mono,
+            )
+            detail_parts = [
+                f"path_restore_phase=action remaining={remaining:.2f}s",
+                f"source_phase={self._path_restore_source_phase}",
+                f"action={action.value}",
+            ]
+            if motion_detail:
+                detail_parts.append(motion_detail)
+            return duties, "path_restore_action", action, "; ".join(detail_parts)
+
+        if now_mono < self._path_restore_counter_until:
+            direction = self._path_restore_counter_direction or "right"
+            remaining = max(0.0, self._path_restore_counter_until - now_mono)
+            detail = (
+                "path_restore_phase=counter_turn "
+                f"direction={direction} remaining={remaining:.2f}s "
+                f"source_phase={self._path_restore_source_phase}"
+            )
+            return self._turn_duties(direction), "path_restore_counter_turn", action, detail
+
+        if now_mono < self._path_restore_assess_until:
+            remaining = max(0.0, self._path_restore_assess_until - now_mono)
+            detail = (
+                "path_restore_phase=assess "
+                f"remaining={remaining:.2f}s "
+                f"source_phase={self._path_restore_source_phase}"
+            )
+            return (0, 0, 0, 0), "path_restore_assess", action, detail
+
+        return None
+
+    def _active_path_restore_context(
+        self,
+        now_mono: float,
+    ) -> tuple[str, str, float, str] | None:
+        if not self._vlm_stop_scan_active(now_mono):
+            return None
+
+        direction = self._vlm_scan_direction or "left"
+        scan_start = self._vlm_scan_turn_until - self._vlm_scan_turn_sec
+        if scan_start <= now_mono < self._vlm_scan_turn_until:
+            return (
+                "vlm_stop_scan_turn",
+                direction,
+                max(0.0, now_mono - scan_start),
+                "vlm_stop",
+            )
+        if self._vlm_scan_turn_until <= now_mono < self._vlm_scan_wait_until:
+            return (
+                "vlm_stop_scan_wait",
+                direction,
+                self._vlm_scan_turn_sec,
+                "vlm_stop",
+            )
+        return None
+
+    def _max_counter_turn_sec(self, source_phase: str) -> float:
+        if source_phase in ("vlm_stop_scan_turn", "vlm_stop_scan_wait"):
+            return max(0.1, self._vlm_scan_turn_sec)
+        return max(0.1, self.policy.vlm_stop_scan_turn_sec)
+
+    def _ultrasonic_escape_active(self, now_mono: float) -> bool:
+        return self._ultrasonic_wait_until > 0.0 and now_mono < self._ultrasonic_wait_until
+
+    def _ultrasonic_wait_active(self, now_mono: float) -> bool:
+        return (
+            self._ultrasonic_turn_until > 0.0
+            and self._ultrasonic_turn_until <= now_mono < self._ultrasonic_wait_until
+        )
+
+    def _clear_ultrasonic_escape(self) -> None:
+        self._ultrasonic_reverse_until = 0.0
+        self._ultrasonic_turn_until = 0.0
+        self._ultrasonic_wait_until = 0.0
+        self._ultrasonic_turn_direction = None
+        self._ultrasonic_turn_sec = 0.0
+
+    def _vlm_stop_scan_active(self, now_mono: float) -> bool:
+        return self._vlm_scan_wait_until > 0.0 and now_mono < self._vlm_scan_wait_until
+
+    def _clear_vlm_stop_scan(self) -> None:
+        self._vlm_scan_turn_until = 0.0
+        self._vlm_scan_wait_until = 0.0
+        self._vlm_scan_direction = None
+        self._vlm_scan_turn_sec = 0.0
+
+    def _path_restore_active(self) -> bool:
+        return self._path_restore_action is not None
+
+    def _clear_path_restore(self) -> None:
+        self._path_restore_action_until = 0.0
+        self._path_restore_counter_until = 0.0
+        self._path_restore_assess_until = 0.0
+        self._path_restore_action = None
+        self._path_restore_counter_direction = None
+        self._path_restore_source_phase = None
+        self._path_restore_counter_sec = 0.0
 
     def _remember_effective_action(self, action: VLMAction, now_mono: float) -> None:
         self._last_action = action
@@ -638,99 +840,11 @@ class ActionDecisionEngine:
                 now_mono + max(0.0, self.policy.steer_cooldown_sec)
             )
 
-    def _probe_turn_duties(self, direction: str) -> DutyTuple:
+    def _turn_duties(self, direction: str) -> DutyTuple:
         turn_speed = max(0, min(4095, self.policy.turn_speed))
         if direction == "left":
             return (-turn_speed, -turn_speed, turn_speed, turn_speed)
         return (turn_speed, turn_speed, -turn_speed, -turn_speed)
-
-    def _get_recovery_phase(self, now_mono: float) -> tuple[DutyTuple | None, str]:
-        if now_mono < self._probe_left_until:
-            remaining = max(0.0, self._probe_left_until - now_mono)
-            detail = (
-                "recovery_phase=probe_left "
-                f"remaining={remaining:.2f}s "
-                f"source={self._probe_source}"
-            )
-            return self._probe_turn_duties("left"), detail
-
-        if self._probe_left_until > 0.0 and now_mono < self._probe_pause_until:
-            remaining = max(0.0, self._probe_pause_until - now_mono)
-            detail = (
-                "recovery_phase=probe_pause "
-                f"remaining={remaining:.2f}s "
-                f"source={self._probe_source}"
-            )
-            return (0, 0, 0, 0), detail
-
-        if self._probe_left_until > 0.0 and now_mono < self._probe_right_until:
-            remaining = max(0.0, self._probe_right_until - now_mono)
-            detail = (
-                "recovery_phase=probe_right "
-                f"remaining={remaining:.2f}s "
-                f"source={self._probe_source}"
-            )
-            return self._probe_turn_duties("right"), detail
-
-        if self._probe_right_until > 0.0 and now_mono < self._probe_assess_until:
-            remaining = max(0.0, self._probe_assess_until - now_mono)
-            detail = (
-                "recovery_phase=probe_assess "
-                f"remaining={remaining:.2f}s "
-                f"source={self._probe_source}"
-            )
-            return (0, 0, 0, 0), detail
-
-        if now_mono < self._recovery_reverse_until:
-            remaining = max(0.0, self._recovery_reverse_until - now_mono)
-            detail = (
-                "recovery_phase=reverse "
-                f"remaining={remaining:.2f}s"
-            )
-            return self._recovery_reverse_duties, detail
-
-        if now_mono < self._recovery_left_turn_until:
-            remaining = max(0.0, self._recovery_left_turn_until - now_mono)
-            detail = (
-                "recovery_phase=left_turn "
-                f"remaining={remaining:.2f}s"
-            )
-            return self._recovery_left_turn_duties, detail
-
-        if now_mono < self._recovery_mid_pause_until:
-            remaining = max(0.0, self._recovery_mid_pause_until - now_mono)
-            detail = (
-                "recovery_phase=turn_pause "
-                f"remaining={remaining:.2f}s"
-            )
-            return (0, 0, 0, 0), detail
-
-        if now_mono < self._recovery_right_turn_until:
-            remaining = max(0.0, self._recovery_right_turn_until - now_mono)
-            detail = (
-                "recovery_phase=right_turn "
-                f"remaining={remaining:.2f}s"
-            )
-            return self._recovery_right_turn_duties, detail
-
-        if now_mono < self._recovery_settle_until:
-            remaining = max(0.0, self._recovery_settle_until - now_mono)
-            detail = (
-                "recovery_phase=settle "
-                f"remaining={remaining:.2f}s"
-            )
-            return (0, 0, 0, 0), detail
-
-        if now_mono < self._recovery_final_right_until:
-            remaining = max(0.0, self._recovery_final_right_until - now_mono)
-            detail = (
-                "recovery_phase=final_right "
-                f"remaining={remaining:.2f}s "
-                f"source={self._recovery_source}"
-            )
-            return self._probe_turn_duties("right"), detail
-
-        return None, ""
 
     def _mark_sustained_stop(self, now_mono: float) -> float:
         if self._sustained_stop_started_at is None:
@@ -837,11 +951,18 @@ class VLMMotionController:
         self._decision_engine = decision_engine
         self._motor_setter = motor_setter
         self._distance_reader = distance_reader
+        self._obstacle_source = UltrasonicObstacleSource(
+            distance_reader=distance_reader,
+            obstacle_trigger_cm=decision_engine.policy.hard_stop_cm,
+            caution_cm=decision_engine.policy.caution_cm,
+            poll_interval_sec=loop_interval_sec,
+        )
         self._loop_interval_sec = max(0.05, loop_interval_sec)
         self._stale_action_timeout_sec = max(0.1, stale_action_timeout_sec)
 
     def run_until_interrupt(self) -> None:
         self._action_source.start()
+        self._obstacle_source.start()
         print("VLM control loop started. Press Ctrl+C to stop.")
 
         last_duties: DutyTuple | None = None
@@ -849,28 +970,37 @@ class VLMMotionController:
         last_effective: VLMAction | None = None
         last_raw_action: VLMAction | None = None
         last_source_err: str | None = None
+        last_obstacle_err: str | None = None
         last_report_at = 0.0
 
         try:
             while True:
                 now = time.monotonic()
-                action, action_age, source_err = self._action_source.latest()
-                distance_cm = self._distance_reader() if self._distance_reader else None
+                raw_action, action_age, source_err = self._action_source.latest()
+                obstacle = self._obstacle_source.latest()
+                action = raw_action
+                distance_cm = obstacle.distance_cm
                 stale_action = (
                     action_age is None or action_age > self._stale_action_timeout_sec
                 )
                 allow_recovery = True
-                if stale_action:
+                arbitration_source = "vlm"
+                if obstacle.obstacle_triggered:
+                    action = VLMAction.STOP
+                    arbitration_source = "ultrasonic"
+                elif stale_action:
                     action = VLMAction.STOP
                     allow_recovery = False
+                    arbitration_source = "vlm_stale"
 
                 duties, reason, effective_action, detail = self._decision_engine.decide(
                     action=action,
                     distance_cm=distance_cm,
                     now_mono=now,
                     allow_recovery=allow_recovery,
+                    ultrasonic_triggered=obstacle.obstacle_triggered,
                 )
-                if stale_action:
+                if stale_action and not obstacle.obstacle_triggered:
                     stale_detail = (
                         "vlm_stale_timeout="
                         f"{self._stale_action_timeout_sec:.2f}s "
@@ -890,12 +1020,14 @@ class VLMMotionController:
                 if state_changed:
                     print(
                         "[EVENT]",
+                        f"source={arbitration_source}",
                         f"rule={reason}",
-                        f"raw={action.value if action else 'none'}",
+                        f"raw_vlm={raw_action.value if raw_action else 'none'}",
                         f"effective={effective_action.value}",
                         f"state={_duties_to_label(duties)}",
                         f"duties={duties}",
                         f"distance_cm={distance_cm}",
+                        f"ultrasonic_triggered={obstacle.obstacle_triggered}",
                         f"detail={detail or 'n/a'}",
                     )
 
@@ -906,21 +1038,31 @@ class VLMMotionController:
                         source_err if source_err else "none",
                     )
 
+                if obstacle.error != last_obstacle_err:
+                    print(
+                        "[ULTRASONIC]",
+                        "distance_error=",
+                        obstacle.error if obstacle.error else "none",
+                    )
+
                 last_duties = duties
                 last_rule = reason
                 last_effective = effective_action
                 last_raw_action = action
                 last_source_err = source_err
+                last_obstacle_err = obstacle.error
 
                 if now - last_report_at >= 1.0:
                     age_text = "n/a" if action_age is None else f"{action_age:.2f}s"
                     print(
                         "[HEARTBEAT]",
-                        f"raw={action.value if action else 'none'}",
+                        f"source={arbitration_source}",
+                        f"raw_vlm={raw_action.value if raw_action else 'none'}",
                         f"effective={effective_action.value}",
                         f"rule={reason}",
                         f"state={_duties_to_label(duties)}",
                         f"distance_cm={distance_cm}",
+                        f"ultrasonic_triggered={obstacle.obstacle_triggered}",
                         f"action_age={age_text}",
                         f"source_err={source_err}",
                     )
@@ -929,4 +1071,5 @@ class VLMMotionController:
                 time.sleep(self._loop_interval_sec)
         finally:
             self._motor_setter(0, 0, 0, 0)
+            self._obstacle_source.stop()
             self._action_source.stop()
